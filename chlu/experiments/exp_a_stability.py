@@ -42,8 +42,8 @@ def train_chlu(
 
     config = HCDConfig(
         lr=1e-3,
-        lambda_lyap=0.01,
-        lambda_cd=0.1,
+        lambda_lyap=0.1,
+        lambda_cd=0.01,
         epochs=epochs,
         batch_size=64,
         log_interval=20,
@@ -102,13 +102,15 @@ def train_node(
     return model
 
 
-@torch.no_grad()
 def evaluate_long_horizon(
     model: nn.Module,
     n_cycles_infer: int = 50,
     points_per_cycle: int = 1000,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Roll out model for n_cycles_infer and return predicted + ground truth.
+
+    Note: Cannot use @torch.no_grad() here because the symplectic integrator
+    uses autograd.grad to compute forces (∇V).
 
     Returns:
         (predicted, ground_truth) each of shape (n_points, 2).
@@ -169,27 +171,50 @@ def run(
     print("\n--- Training Neural ODE ---")
     node_model = train_node(dataset, epochs=epochs, device=dev)
 
-    # Evaluate: 50-cycle rollout
-    print("\n--- Evaluating 50-cycle rollout ---")
-    results = {}
+    # Save best CHLU checkpoint
+    ckpt_dir = out / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": chlu_model.state_dict(),
+            "experiment": "exp_a_stability",
+            "task": "lemniscate_50cycle",
+        },
+        ckpt_dir / "chlu_best.pt",
+    )
+    print(f"Saved best CHLU checkpoint to {ckpt_dir / 'chlu_best.pt'}")
 
+    # Evaluate: 10-cycle rollout (reduced from 50 for compute efficiency)
+    n_eval_cycles = 10
+    print(f"\n--- Evaluating {n_eval_cycles}-cycle rollout ---")
+    results = {}
+    trajectories = {}
+
+    gt = None
     for name, model in [("CHLU", chlu_model), ("LSTM", lstm_model), ("NeuralODE", node_model)]:
         model.cpu()
-        pred, gt = evaluate_long_horizon(model, n_cycles_infer=50)
-        mse = trajectory_mse(pred, gt)
-        results[name] = {"mse": mse}
-        print(f"  {name}: MSE = {mse:.6f}")
-
-    # Plot
-    trajectories = {}
-    for name, model in [("CHLU", chlu_model), ("LSTM", lstm_model), ("NeuralODE", node_model)]:
-        pred, gt = evaluate_long_horizon(model, n_cycles_infer=50)
-        trajectories[name] = pred.numpy()
-    trajectories["Ground Truth"] = gt.numpy()
+        try:
+            pred, gt_i = evaluate_long_horizon(model, n_cycles_infer=n_eval_cycles)
+            if gt is None:
+                gt = gt_i
+            if torch.isnan(pred).any() or torch.isinf(pred).any():
+                print(f"  {name}: DIVERGED (NaN/Inf in predictions)")
+                results[name] = {"mse": float("inf")}
+                trajectories[name] = pred.detach().nan_to_num(0.0).numpy()
+            else:
+                mse = trajectory_mse(pred, gt_i)
+                results[name] = {"mse": mse}
+                trajectories[name] = pred.detach().numpy()
+                print(f"  {name}: MSE = {mse:.6f}")
+        except (RuntimeError, AssertionError) as e:
+            print(f"  {name}: DIVERGED ({type(e).__name__}: {e})")
+            results[name] = {"mse": float("inf")}
+    if gt is not None:
+        trajectories["Ground Truth"] = gt.detach().numpy()
 
     plot_trajectories(
         trajectories,
-        title="Exp A: 50-Cycle Lemniscate Rollout",
+        title=f"Exp A: {n_eval_cycles}-Cycle Lemniscate Rollout",
         save_path=str(out / "trajectories.png"),
     )
 

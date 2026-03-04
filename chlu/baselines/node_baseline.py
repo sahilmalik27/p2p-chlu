@@ -91,6 +91,10 @@ class NeuralODEBaseline(nn.Module):
     ) -> Tensor:
         """Generate a sequence by repeated ODE integration.
 
+        Wraps each integration step in try/except to handle dopri5
+        'underflow in dt' errors that occur when the ODE becomes stiff.
+        On divergence, remaining outputs are filled with NaN.
+
         Args:
             x0: Initial input, shape (batch, input_dim).
             seq_len: Number of output time steps.
@@ -102,11 +106,31 @@ class NeuralODEBaseline(nn.Module):
         spo = steps_per_output if steps_per_output is not None else self.n_steps
         z = self.encoder(x0)
         outputs: list[Tensor] = []
+        diverged = False
 
-        for _ in range(seq_len):
-            t_span = torch.linspace(0, self.dt * spo, 2, device=x0.device)
-            z_traj = odeint(self.ode_func, z, t_span, method="dopri5")
-            z = z_traj[-1]
-            outputs.append(self.decoder(z))
+        for i in range(seq_len):
+            if diverged:
+                outputs.append(torch.full_like(outputs[0], float("nan")))
+                continue
+            try:
+                t_span = torch.linspace(0, self.dt * spo, 2, device=x0.device)
+                z_traj = odeint(self.ode_func, z, t_span, method="dopri5")
+                z = z_traj[-1]
+                out = self.decoder(z)
+                if torch.isnan(out).any() or torch.isinf(out).any():
+                    diverged = True
+                    outputs.append(torch.full(
+                        (x0.shape[0], self.input_dim), float("nan"), device=x0.device,
+                    ))
+                else:
+                    outputs.append(out)
+            except (RuntimeError, AssertionError):
+                diverged = True
+                if outputs:
+                    outputs.append(torch.full_like(outputs[0], float("nan")))
+                else:
+                    outputs.append(torch.full(
+                        (x0.shape[0], self.input_dim), float("nan"), device=x0.device,
+                    ))
 
         return torch.stack(outputs, dim=1)

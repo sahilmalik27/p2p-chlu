@@ -14,18 +14,22 @@ from torch import Tensor
 
 
 class PotentialMLP(nn.Module):
-    """Learnable potential energy V_θ(q) as a small MLP."""
+    """Learnable potential energy V_θ(q) as a small MLP.
+
+    Uses spectral normalization on all linear layers to bound the Lipschitz
+    constant, preventing unbounded energy growth during long rollouts.
+    """
 
     def __init__(self, dim: int, hidden_dims: tuple[int, ...] = (128, 128)) -> None:
         super().__init__()
         layers: list[nn.Module] = []
         in_dim = dim
         for h in hidden_dims:
-            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.utils.parametrizations.spectral_norm(nn.Linear(in_dim, h)))
             layers.append(nn.SiLU())
             in_dim = h
         # Scalar output — potential energy
-        layers.append(nn.Linear(in_dim, 1))
+        layers.append(nn.utils.parametrizations.spectral_norm(nn.Linear(in_dim, 1)))
         self.net = nn.Sequential(*layers)
 
     def forward(self, q: Tensor) -> Tensor:

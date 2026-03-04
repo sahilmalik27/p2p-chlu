@@ -4,7 +4,7 @@ __pycache__/
 dist/
 build/
 .venv/
-*.pt
-*.pth
-results/
+# *.pt - allow experiment checkpoints
+# *.pth - allow model weights
+# results/ - include experiment outputs
 .pytest_cache/

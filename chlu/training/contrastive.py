@@ -8,12 +8,13 @@ Wake-sleep training scheme from arXiv:2603.01768v1:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import copy
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
-from torch.optim import Optimizer
 from tqdm import tqdm
 
 from chlu.core.chlu_unit import CHLUUnit
@@ -41,6 +42,8 @@ class HCDTrainer:
     """Hamiltonian Contrastive Divergence trainer for CHLUUnit.
 
     Implements the wake-sleep training procedure with replay buffer.
+    CD loss uses softplus normalization on energies to prevent divergence,
+    combined with spectral normalization on the potential network.
 
     Args:
         model: The CHLUUnit model to train.
@@ -58,8 +61,12 @@ class HCDTrainer:
         self.config = config or HCDConfig()
         self.device = device or torch.device("cpu")
         self.model.to(self.device)
+        self._current_epoch = 0
 
         self.optimizer = torch.optim.Adam(model.parameters(), lr=self.config.lr)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=self.config.epochs, eta_min=self.config.lr * 0.01,
+        )
         self.buffer = ReplayBuffer(
             capacity=self.config.buffer_capacity,
             dim=model.latent_dim,
@@ -130,6 +137,10 @@ class HCDTrainer:
     ) -> dict[str, float]:
         """One training step of Hamiltonian Contrastive Divergence.
 
+        CD loss uses softplus normalization: log(1+exp(H)) to prevent
+        unbounded energy values from causing gradient explosion.
+        CD is only enabled after warmup_epochs to let MSE converge first.
+
         Args:
             x: Input batch.
             target: Target batch.
@@ -143,29 +154,29 @@ class HCDTrainer:
         # Wake phase
         wake_loss, q_wake, p_wake, metrics = self.wake_phase(x, target)
 
-        # Contrastive term
+        # Contrastive divergence with softplus-normalized energy
         H_wake = self.model.hamiltonian(q_wake, p_wake).mean()
         cd_loss = torch.tensor(0.0, device=self.device)
 
         sleep_result = self.sleep_phase(x.shape[0])
-        if sleep_result is not None:
-            H_sleep, q_sleep, p_sleep = sleep_result
-            # CD gradient: push down wake energy, push up sleep energy
-            cd_loss = self.config.lambda_cd * (H_wake - H_sleep)
-            # Store hallucinated states
-            self.buffer.push(q_sleep, p_sleep)
-        else:
-            # Warmup: just store wake states
-            self.buffer.push(q_wake, p_wake)
+        # Store wake states in replay buffer (detached to avoid graph retention)
+        self.buffer.push(q_wake.detach(), p_wake.detach())
 
-        total_loss = wake_loss + cd_loss
+        if sleep_result is not None and self._current_epoch >= self.config.warmup_epochs:
+            H_sleep, _, _ = sleep_result
+            # Softplus normalization prevents unbounded energy from blowing up CD
+            cd_loss = F.softplus(H_wake) - F.softplus(H_sleep)
+            cd_loss = cd_loss.clamp(-2.0, 2.0)
+
+        total_loss = wake_loss + self.config.lambda_cd * cd_loss
         total_loss.backward()
         nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
 
+        cd_val = cd_loss.item() if isinstance(cd_loss, Tensor) else cd_loss
         metrics.update({
             "total_loss": total_loss.item(),
-            "cd_loss": cd_loss.item(),
+            "cd_loss": cd_val,
             "H_wake": H_wake.item(),
         })
         return metrics
@@ -192,8 +203,12 @@ class HCDTrainer:
         )
 
         history: list[dict[str, float]] = []
+        best_mse = float("inf")
+        best_state: dict | None = None
+        best_epoch = 0
 
         for epoch in range(self.config.epochs):
+            self._current_epoch = epoch
             epoch_metrics: dict[str, list[float]] = {}
 
             pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.config.epochs}", leave=False)
@@ -207,8 +222,8 @@ class HCDTrainer:
                     epoch_metrics.setdefault(k, []).append(v)
 
                 pbar.set_postfix(
-                    loss=f"{step_metrics['total_loss']:.4f}",
-                    mse=f"{step_metrics['mse']:.4f}",
+                    loss=f"{step_metrics['total_loss']:.8f}",
+                    mse=f"{step_metrics['mse']:.8f}",
                 )
 
             # Aggregate epoch metrics
@@ -216,12 +231,37 @@ class HCDTrainer:
             avg_metrics["epoch"] = epoch + 1
             history.append(avg_metrics)
 
+            # Track best model by MSE
+            if avg_metrics["mse"] < best_mse:
+                best_mse = avg_metrics["mse"]
+                best_epoch = epoch + 1
+                best_state = copy.deepcopy(self.model.state_dict())
+
+            # Step learning rate scheduler
+            self.scheduler.step()
+
+            # Early stopping: if MSE hasn't improved in 20 epochs, stop
+            if epoch + 1 > 20 and best_epoch < epoch + 1 - 20:
+                print(f"[Early stop] No MSE improvement for 20 epochs (best at epoch {best_epoch})")
+                break
+
             if (epoch + 1) % self.config.log_interval == 0:
                 print(
                     f"[Epoch {epoch+1}] "
-                    f"loss={avg_metrics['total_loss']:.4f} "
-                    f"mse={avg_metrics['mse']:.4f} "
-                    f"lyap={avg_metrics['lyapunov']:.6f}"
+                    f"loss={avg_metrics['total_loss']:.8f} "
+                    f"mse={avg_metrics['mse']:.8f} "
+                    f"lyap={avg_metrics['lyapunov']:.8f} "
+                    f"cd={avg_metrics['cd_loss']:.8f}"
+                    f" lr={self.scheduler.get_last_lr()[0]:.6f}"
                 )
+
+        # Restore best model weights
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+            print(f"[Best model] epoch={best_epoch} mse={best_mse:.8f}")
+
+        # Store best info for checkpoint saving
+        self._best_epoch = best_epoch
+        self._best_mse = best_mse
 
         return history

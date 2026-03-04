@@ -44,8 +44,8 @@ def train_chlu(
 
     config = HCDConfig(
         lr=1e-3,
-        lambda_lyap=0.01,
-        lambda_cd=0.1,
+        lambda_lyap=0.1,
+        lambda_cd=0.01,
         epochs=epochs,
         batch_size=64,
         log_interval=20,
@@ -104,7 +104,6 @@ def train_node(
     return model
 
 
-@torch.no_grad()
 def evaluate_perturbation(
     model: nn.Module,
     omega: float = 1.0,
@@ -181,6 +180,19 @@ def run(
     print("\n--- Training Neural ODE ---")
     node_model = train_node(dataset, epochs=epochs, device=dev)
 
+    # Save best CHLU checkpoint
+    ckpt_dir = out / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": chlu_model.state_dict(),
+            "experiment": "exp_b_safety",
+            "task": "sine_perturbation",
+        },
+        ckpt_dir / "chlu_best.pt",
+    )
+    print(f"Saved best CHLU checkpoint to {ckpt_dir / 'chlu_best.pt'}")
+
     # Evaluate with perturbation
     print("\n--- Evaluating with perturbation (5x velocity kick) ---")
     results = {}
@@ -189,19 +201,27 @@ def run(
 
     for name, model in [("CHLU", chlu_model), ("LSTM", lstm_model), ("NeuralODE", node_model)]:
         model.cpu()
-        pred_pert, pred_nom = evaluate_perturbation(model, perturb_scale=5.0)
+        try:
+            pred_pert, pred_nom = evaluate_perturbation(model, perturb_scale=5.0)
 
-        # Kinetic energy: 0.5 * v²
-        ke_pert = 0.5 * pred_pert[:, 1] ** 2
-        ke_nom = 0.5 * pred_nom[:, 1] ** 2
-        max_ke = ke_pert.max().item()
-        max_v = pred_pert[:, 1].abs().max().item()
+            if torch.isnan(pred_pert).any() or torch.isinf(pred_pert).any():
+                print(f"  {name}: DIVERGED (NaN/Inf in predictions)")
+                results[name] = {"max_kinetic_energy": float("inf"), "max_velocity": float("inf")}
+                continue
 
-        results[name] = {"max_kinetic_energy": max_ke, "max_velocity": max_v}
-        phase_data[name] = pred_pert.numpy()
-        ke_data[name] = ke_pert.numpy()
+            # Kinetic energy: 0.5 * v²
+            ke_pert = 0.5 * pred_pert[:, 1] ** 2
+            max_ke = ke_pert.max().item()
+            max_v = pred_pert[:, 1].abs().max().item()
 
-        print(f"  {name}: max_KE={max_ke:.4f}, max_v={max_v:.4f}")
+            results[name] = {"max_kinetic_energy": max_ke, "max_velocity": max_v}
+            phase_data[name] = pred_pert.detach().numpy()
+            ke_data[name] = ke_pert.detach().numpy()
+
+            print(f"  {name}: max_KE={max_ke:.4f}, max_v={max_v:.4f}")
+        except (RuntimeError, AssertionError) as e:
+            print(f"  {name}: DIVERGED ({type(e).__name__}: {e})")
+            results[name] = {"max_kinetic_energy": float("inf"), "max_velocity": float("inf")}
 
     # Plot phase space
     plot_phase_space(

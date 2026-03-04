@@ -93,8 +93,8 @@ def train_chlu_mnist(
 
     config = HCDConfig(
         lr=5e-4,
-        lambda_lyap=0.001,
-        lambda_cd=0.05,
+        lambda_lyap=0.01,
+        lambda_cd=0.005,
         epochs=epochs,
         batch_size=128,
         log_interval=10,
@@ -106,7 +106,6 @@ def train_chlu_mnist(
     return model
 
 
-@torch.no_grad()
 def generate_digits(
     model: CHLUUnit,
     centroids: dict[int, torch.Tensor],
@@ -201,6 +200,19 @@ def run(
     print("\n--- Training CHLU ---")
     model = train_chlu_mnist(dataset, epochs=epochs, device=dev)
 
+    # Save best CHLU checkpoint
+    ckpt_dir = out / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "experiment": "exp_c_generate",
+            "task": "mnist_generation",
+        },
+        ckpt_dir / "chlu_best.pt",
+    )
+    print(f"Saved best CHLU checkpoint to {ckpt_dir / 'chlu_best.pt'}")
+
     # Generate
     print(f"\n--- Generating {n_per_digit} digits per class ---")
     model.cpu()
@@ -213,12 +225,12 @@ def run(
 
     # Plot grid
     plot_generated_digits(
-        generated.numpy(),
+        generated.detach().numpy(),
         n_per_digit=n_per_digit,
         save_path=str(out / "generated_digits.png"),
     )
 
     # Save raw
-    torch.save(generated, out / "generated_digits.pt")
+    torch.save(generated.detach(), out / "generated_digits.pt")
 
     print(f"\nGenerated {generated.shape[0]} digits, saved to {out}")
